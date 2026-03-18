@@ -1,0 +1,14 @@
+{
+  "name": "vep-bridge",
+  "version": "1.0.0",
+  "description": "Visual Element Picker bridge server — receives browser prompts and calls claude -p",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "start:alt": "VEP_PORT=3334 node server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {}
+}
