@@ -20,11 +20,14 @@ const buildPrompt = require('./prompt-builder');
 const PORT = parseInt(process.env.VEP_PORT || '3333', 10);
 const OVERLAY_DIR = path.join(__dirname, 'overlay');
 const TEMP_DIRNAME = '.vep-temp';
-const CONFIG_PATH = path.join(os.tmpdir(), 'vep-config.json');
+const CONFIG_PATH   = path.join(os.tmpdir(), 'vep-config.json');
+const REGISTRY_PATH = path.join(os.tmpdir(), 'vep-registry.json');
 
-// Accept --project-dir <path> when bridge is started manually
+// Accept --project-dir <path> and --dev-server-url <url> when bridge is started manually
 const _argIdx = process.argv.indexOf('--project-dir');
 const CLI_PROJECT_DIR = _argIdx !== -1 ? process.argv[_argIdx + 1] : null;
+const _urlArgIdx = process.argv.indexOf('--dev-server-url');
+const CLI_DEV_SERVER_URL = _urlArgIdx !== -1 ? process.argv[_urlArgIdx + 1] : null;
 
 // ── Queue: only one claude -p at a time ──────────────────────────────────────
 let isProcessing = false;
@@ -75,18 +78,43 @@ function getConfig() {
   try {
     return JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
   } catch {
+    // Fall back to CLI arguments (bridge started manually or before config is written).
+    // CLI_DEV_SERVER_URL is passed by detect-server.js so CORS is always specific.
     if (CLI_PROJECT_DIR) {
-      return { projectDir: path.normalize(CLI_PROJECT_DIR), devServerUrl: 'http://localhost:3000' };
+      return { projectDir: path.normalize(CLI_PROJECT_DIR), devServerUrl: CLI_DEV_SERVER_URL || 'http://localhost:3000' };
     }
     console.warn('[VEP] WARNING: No vep-config.json found and no --project-dir arg. Pass --project-dir to target the correct project.');
-    return { projectDir: process.cwd(), devServerUrl: 'http://localhost:3000' };
+    return { projectDir: process.cwd(), devServerUrl: CLI_DEV_SERVER_URL || 'http://localhost:3000' };
   }
 }
 
-function setCors(res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
+function getAllowedOrigin(reqOrigin) {
+  // Multi-server: check against ALL origins in the registry first
+  try {
+    const registry = JSON.parse(fs.readFileSync(REGISTRY_PATH, 'utf8'));
+    const origins  = Object.values(registry.servers)
+      .map(s => { try { return new URL(s.devServerUrl).origin; } catch { return null; } })
+      .filter(Boolean);
+    if (origins.includes(reqOrigin)) return reqOrigin;
+  } catch { /* registry not yet created — fall through to single-config check */ }
+
+  // Fall back to single config (backwards compatible with no-registry startup)
+  try {
+    const config = getConfig();
+    return new URL(config.devServerUrl || 'http://localhost:3000').origin;
+  } catch {
+    // Security: do NOT fall back to caller-supplied origin.
+    return 'http://localhost:3000';
+  }
+}
+
+function setCors(res, reqOrigin) {
+  const allowed = getAllowedOrigin(reqOrigin);
+  // Only allow requests from the known dev server origin — never wildcard
+  res.setHeader('Access-Control-Allow-Origin', reqOrigin === allowed ? allowed : 'null');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Vary', 'Origin');
 }
 
 function serveFile(res, filePath, contentType) {
@@ -282,7 +310,7 @@ async function handlePrompt(req, res) {
 // ── HTTP server ───────────────────────────────────────────────────────────────
 
 const server = http.createServer(async (req, res) => {
-  setCors(res);
+  setCors(res, req.headers['origin'] || '');
 
   // Preflight
   if (req.method === 'OPTIONS') {
@@ -346,10 +374,13 @@ server.listen(PORT, '127.0.0.1', () => {
   console.log(`[VEP] Overlay script: http://localhost:${PORT}/overlay.js`);
 
   // Write vep-config.json so inject-queue.js (Claude Code hook) can find
-  // the activity file even when bridge was started manually with --project-dir
+  // the activity file even when bridge was started manually with --project-dir.
+  // Preserve htmlEntryPoint written by detect-server.js so gracefulShutdown can clean up.
   const startupConfig = getConfig();
   try {
+    const existing = (() => { try { return JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')); } catch { return {}; } })();
     fs.writeFileSync(CONFIG_PATH, JSON.stringify({
+      ...existing,
       projectDir: startupConfig.projectDir,
       devServerUrl: startupConfig.devServerUrl,
       startedAt: new Date().toISOString(),
@@ -367,5 +398,29 @@ server.on('error', err => {
   process.exit(1);
 });
 
-process.on('SIGTERM', () => { server.close(); process.exit(0); });
-process.on('SIGINT', () => { server.close(); process.exit(0); });
+const VEP_BLOCK_RE = /\n?<!-- VEP:START -->[\s\S]*?<!-- VEP:END -->\n?/g;
+
+function removeOverlay(htmlPath) {
+  if (!htmlPath) return;
+  try {
+    const content = fs.readFileSync(htmlPath, 'utf8');
+    const cleaned = content.replace(VEP_BLOCK_RE, '');
+    if (cleaned !== content) {
+      fs.writeFileSync(htmlPath, cleaned, 'utf8');
+      console.log(`[VEP] Removed overlay injection from ${htmlPath}`);
+    }
+  } catch { /* non-fatal */ }
+}
+
+function gracefulShutdown(signal) {
+  console.log(`\n[VEP] ${signal} received. Cleaning up…`);
+  try {
+    const config = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+    removeOverlay(config.htmlEntryPoint || null);
+  } catch { /* config may not exist if bridge was started manually */ }
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 3000).unref();
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT',  () => gracefulShutdown('SIGINT'));

@@ -7,11 +7,13 @@
 
 function buildPrompt(payload, sourceInfo, screenshotPath) {
   const {
-    userPrompt = '',
     element = {},
     pageUrl = '',
     pageTitle = '',
   } = payload;
+  // Security: cap userPrompt to prevent prompt injection via oversized payloads.
+  // Normal developer prompts are 30–150 chars; 500 is a generous legitimate limit.
+  const userPrompt = (payload.userPrompt || '').slice(0, 500);
 
   // ── Element info ──────────────────────────────────────────────────────────
   const tagName = element.tagName || 'UNKNOWN';

@@ -52,6 +52,43 @@ function extractDevServerUrl(stdout) {
   return 'http://localhost:3000';
 }
 
+function extractPort(stdout, command) {
+  const m = (stdout + ' ' + command).match(/localhost:(\d+)/i);
+  if (m) return parseInt(m[1], 10);
+  const pFlag = command.match(/--port[=\s]+(\d+)/);
+  if (pFlag) return parseInt(pFlag[1], 10);
+  return 3000;
+}
+
+function findHtmlEntryPoint(projectDir) {
+  const candidates = [
+    'index.html',
+    path.join('public', 'index.html'),
+    path.join('src', 'index.html'),
+    path.join('app', 'index.html'),
+  ];
+  for (const rel of candidates) {
+    const abs = path.join(projectDir, rel);
+    if (fs.existsSync(abs)) return abs;
+  }
+  return null;
+}
+
+const VEP_MARKER_START = '<!-- VEP:START -->';
+const VEP_MARKER_END   = '<!-- VEP:END -->';
+
+function injectOverlay(htmlPath, bridgePort) {
+  if (!htmlPath) return false;
+  try {
+    let content = fs.readFileSync(htmlPath, 'utf8');
+    if (content.includes(VEP_MARKER_START)) return false; // idempotent
+    const block = `\n${VEP_MARKER_START}\n<script src="http://localhost:${bridgePort}/overlay.js"></script>\n${VEP_MARKER_END}`;
+    const updated = content.replace(/(<\/body>)/i, block + '\n$1');
+    fs.writeFileSync(htmlPath, updated === content ? content + '\n' + block + '\n' : updated, 'utf8');
+    return true;
+  } catch { return false; }
+}
+
 function isPortInUse(port) {
   return new Promise(resolve => {
     const server = net.createServer();
@@ -96,15 +133,42 @@ async function main() {
   const pluginRoot = process.env.CLAUDE_PLUGIN_ROOT || path.join(__dirname, '..');
   const bridgePort = parseInt(process.env.VEP_PORT || '3333', 10);
 
+  const port = extractPort(stdout, toolInput?.command || '');
+  const htmlEntryPoint = findHtmlEntryPoint(path.normalize(projectDir));
+  const injected = injectOverlay(htmlEntryPoint, bridgePort);
+
   // Write handoff config for bridge server
   const configPath = path.join(os.tmpdir(), 'vep-config.json');
   const config = {
     projectDir: path.normalize(projectDir),
     devServerUrl,
+    port,
+    htmlEntryPoint,
     pluginRoot: path.normalize(pluginRoot),
     startedAt: new Date().toISOString(),
   };
   fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+
+  // Also update the multi-server registry so bridge CORS and inject-queue both see this server
+  const registryPath = path.join(os.tmpdir(), 'vep-registry.json');
+  try {
+    const registry = (() => {
+      try { return JSON.parse(fs.readFileSync(registryPath, 'utf8')); }
+      catch { return { servers: {} }; }
+    })();
+    registry.servers[String(port)] = {
+      port,
+      devServerUrl,
+      projectDir: path.normalize(projectDir),
+      htmlEntryPoint,
+      source: 'hook',
+      overlayInjected: injected,
+      discoveredAt: registry.servers[String(port)]?.discoveredAt || new Date().toISOString(),
+      lastSeen: new Date().toISOString(),
+    };
+    registry.updatedAt = new Date().toISOString();
+    fs.writeFileSync(registryPath, JSON.stringify(registry, null, 2));
+  } catch { /* non-fatal */ }
 
   // Start bridge if not already running
   const portBusy = await isPortInUse(bridgePort);
@@ -112,13 +176,23 @@ async function main() {
     const bridgeScript = path.join(pluginRoot, 'bridge', 'server.js');
     const logFile = path.join(path.normalize(projectDir), '.vep-bridge.log');
     const logFd = fs.openSync(logFile, 'a');
-    const child = spawn(process.execPath, [bridgeScript, '--project-dir', path.normalize(projectDir)], {
+    const child = spawn(process.execPath, [bridgeScript, '--project-dir', path.normalize(projectDir), '--dev-server-url', devServerUrl], {
       detached: true,
       stdio: ['ignore', logFd, logFd],  // stdout+stderr → log file (not discarded)
       shell: false,   // never shell:true — Windows paths with spaces break spawn
       env: { ...process.env, VEP_PORT: String(bridgePort) },
     });
     child.unref();
+  }
+
+  // Build injection status line for context message
+  let injectionLine;
+  if (injected) {
+    injectionLine = `Overlay auto-injected into: ${htmlEntryPoint}`;
+  } else if (htmlEntryPoint) {
+    injectionLine = `NOTE: Could not write to ${htmlEntryPoint} — add the script tag manually:\n  <script src="http://localhost:${bridgePort}/overlay.js"></script>`;
+  } else {
+    injectionLine = `NOTE: No index.html found — add the script tag manually:\n  <script src="http://localhost:${bridgePort}/overlay.js"></script>`;
   }
 
   // Output message into Claude's context
@@ -129,14 +203,12 @@ async function main() {
         '',
         `🎯 Visual Element Picker active (bridge on http://localhost:${bridgePort})`,
         '',
-        'Add this to your HTML entry point to enable in-browser element editing:',
+        injectionLine,
         '',
-        `  <script src="http://localhost:${bridgePort}/overlay.js"></script>`,
-        '',
-        'Then open your app → click [✦ Edit] in the bottom-right → hover any element → click → type your change.',
+        'Open your app → click [✦ Edit] in the bottom-right → hover any element → click → type your change.',
         'Press Alt+E to toggle pick mode. App behaves normally when pick mode is off.',
         '',
-        `Watch bridge logs in a terminal: Get-Content -Wait "${path.join(path.normalize(projectDir), '.vep-bridge.log')}"`,
+        `Watch bridge logs: Get-Content -Wait "${path.join(path.normalize(projectDir), '.vep-bridge.log')}"`,
         '',
       ].join('\n'),
     },

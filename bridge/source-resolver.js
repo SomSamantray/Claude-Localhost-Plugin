@@ -9,9 +9,8 @@
 
 const fs = require('fs');
 const path = require('path');
-const { execSync } = require('child_process');
 
-const SOURCE_EXTENSIONS = ['jsx', 'tsx', 'js', 'ts', 'vue', 'svelte', 'html'];
+const SOURCE_EXTENSIONS = new Set(['jsx', 'tsx', 'js', 'ts', 'vue', 'svelte', 'html']);
 
 async function resolveSource(payload, projectDir) {
   const { element = {}, sourceInfo = {} } = payload;
@@ -20,13 +19,20 @@ async function resolveSource(payload, projectDir) {
   if (sourceInfo?.componentFile) {
     // The overlay extracts this from React's __reactFiber internal
     const abs = path.resolve(projectDir, sourceInfo.componentFile);
-    if (fs.existsSync(abs)) {
+    // Security: ensure the resolved path stays within projectDir.
+    // path.resolve() with an absolute componentFile ignores projectDir entirely,
+    // allowing traversal to arbitrary files (e.g. "../../../../.env").
+    const normalizedProject = path.normalize(projectDir);
+    const rel = path.relative(normalizedProject, abs);
+    const escapesProject = rel.startsWith('..') || path.isAbsolute(rel);
+    if (!escapesProject && fs.existsSync(abs)) {
       return {
         file: sourceInfo.componentFile,
         line: sourceInfo.componentLine || null,
         method: 'react-fiber',
       };
     }
+    // If path escapes projectDir, fall through silently to grep strategies
   }
 
   // Determine search root
@@ -66,43 +72,60 @@ async function resolveSource(payload, projectDir) {
 }
 
 /**
- * Grep for `term` under `dir`, returning { file, line } of the first match.
- * Works on Windows (findstr) and Unix (grep).
+ * Search for `term` under `dir` using pure Node.js — no shell, no injection risk.
+ * Returns { file, line } of the first match, or null.
  */
 function grep(term, dir) {
-  // Sanitize: remove characters unsafe in shell quotes
-  const safe = term.replace(/[`$"\\]/g, ' ').trim();
-  if (!safe) return null;
+  const needle = term.trim();
+  if (!needle) return null;
 
   try {
-    let output;
-    const extGlob = SOURCE_EXTENSIONS.join(',');
-
-    if (process.platform === 'win32') {
-      // findstr: recursive, case-insensitive, with line numbers
-      // Limited glob support — search common extensions individually
-      const exts = SOURCE_EXTENSIONS.map(e => `"${dir}\\*.${e}"`).join(' ');
-      const cmd = `findstr /s /n /i /c:"${safe}" ${exts} 2>nul`;
-      output = execSync(cmd, { encoding: 'utf8', timeout: 5000 });
-    } else {
-      const cmd = `grep -rn --include="*.{${extGlob}}" "${safe}" "${dir}" 2>/dev/null`;
-      output = execSync(cmd, { encoding: 'utf8', timeout: 5000 });
-    }
-
-    const lines = output.trim().split('\n').filter(Boolean);
-    if (!lines.length) return null;
-
-    // Format: /path/to/file.jsx:42:  <button className="btn-primary">
-    const match = lines[0].match(/^(.+?):(\d+):/);
-    if (!match) return null;
-
-    return {
-      file: path.relative(dir, match[1]).replace(/\\/g, '/'),
-      line: parseInt(match[2], 10),
-    };
+    return walkAndSearch(dir, needle, dir);
   } catch {
     return null;
   }
+}
+
+/**
+ * Recursively walk `dir`, searching each source file for `needle`.
+ * Returns { file, line } on first match, null otherwise.
+ */
+function walkAndSearch(dir, needle, rootDir) {
+  let entries;
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return null;
+  }
+
+  for (const entry of entries) {
+    // Skip hidden dirs and node_modules
+    if (entry.name.startsWith('.') || entry.name === 'node_modules') continue;
+
+    const fullPath = path.join(dir, entry.name);
+
+    if (entry.isDirectory()) {
+      const hit = walkAndSearch(fullPath, needle, rootDir);
+      if (hit) return hit;
+    } else if (entry.isFile()) {
+      const ext = entry.name.split('.').pop();
+      if (!SOURCE_EXTENSIONS.has(ext)) continue;
+
+      try {
+        const lines = fs.readFileSync(fullPath, 'utf8').split('\n');
+        for (let i = 0; i < lines.length; i++) {
+          if (lines[i].includes(needle)) {
+            return {
+              file: path.relative(rootDir, fullPath).replace(/\\/g, '/'),
+              line: i + 1,
+            };
+          }
+        }
+      } catch { /* skip unreadable files */ }
+    }
+  }
+
+  return null;
 }
 
 module.exports = resolveSource;
